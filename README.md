@@ -1,14 +1,8 @@
 # BTM9011EP
 
-
 STM32 HAL için tek BTM9011EP sürücüsü. Hedef: **Actuonix P8 `-S`** (2 kablolu,
 strok sonu limit switch'li) lineer aktüatörü iki uç nokta arasında sürmek.
 Tam hız veya PWM; ikisi de süreli ve kendi kendine frenler.
-
-> **v2'den farkı iki maddedir** (ayrıntı: [`DEGISIKLIKLER.md`](DEGISIKLIKLER.md)):
-> 1. `BTM_ClearFault()` — hata kilidi artık MCU reset'i gerektirmiyor;
-> 2. hareket süresi uygulanan duty ile ölçekleniyor, yani düşük duty'de de strok
->    tamamlanıyor (`BTM_Status.move_ms` + iki bayrak bunu bildiriyor).
 
 FOC gibi mikrosaniye hassasiyetli bir kontrol döngüsüyle **aynı MCU'da** çalışmak
 üzere yazılmıştır: hiçbir yerde kesme maskelemez, ISR'larında meşgul bekleme yoktur.
@@ -16,15 +10,8 @@ FOC gibi mikrosaniye hassasiyetli bir kontrol döngüsüyle **aynı MCU'da** ça
 | Dosya | |
 |---|---|
 | `BTM9011EP.h` / `BTM9011EP.c` | Sürücü (saf HAL, FreeRTOS başlığı include etmez) |
-| `ENTEGRASYON.md` | STM32F407 DISC1 üzerinde sıfırdan kurulum, CubeMX ekran ekran |
-| `DEGISIKLIKLER.md` | v2 → v3 ve v3 → v3.1 değişiklikleri, taşıma notları |
-| `tests/` | Host testi; gerçek `.c`'yi taklit HAL ile derler, donanım gerekmez |
-
-Önceki sürümler (`BTM9011EP_Sade` = v1, `BTM9011EP_Sade_v2`) ve onları karşılaştıran
-`KARSILASTIRMA_RAPORU.md` **git geçmişindedir** — ilk kayıtta (`git show 447b921`).
-Çalışma klasöründen çıkarıldılar, çünkü v3 ikisinin de işlevsel kapsamı ve üç klasör
-aynı dosya adlarını taşıdığı için yanlış sürümü karta kopyalamak kolaydı.
-Raporun §7.1 ve §7.2 önerileri v3'te uygulanmıştır (`DEGISIKLIKLER.md`).
+| [`INTEGRATION.md`](INTEGRATION.md) | **Projeye entegrasyon:** çevre birimleri, callback'ler, kullanım, devreye alma |
+| [`examples/`](examples/) | Derlenmiş örnek kod: callback'ler, ilk deneme, süper döngü, FreeRTOS sahip görevi |
 
 ---
 
@@ -295,149 +282,10 @@ Bedeli duyulabilir bantta hafif ıslık (aktüatör zaten 50 dB @ 45 cm).
 
 ## 6. Kurulum
 
-### 6.1 CubeMX
+Çevre birimi ayarları, callback yönlendirmeleri, `BTM_Config`, hareket/durum/hata
+kullanımı ve sahip görev kuralı [`INTEGRATION.md`](INTEGRATION.md)'de.
 
-| Kaynak | Ayar |
-|---|---|
-| SPI | Full-Duplex Master, 8 bit, MSB First, **CPOL Low + CPHA 2 Edge** (Mode 1), NSS Software, CRC Disabled, prescaler ≈ 328 kHz. **Global interrupt Enabled**, DMA boş |
-| SPI GPIO | SCK/MOSI No pull, **MISO Pull-up**, hız Very High |
-| CS | GPIO_Output, Push-Pull, No pull, **başlangıç Low** (CS aktif High) |
-| TIM | Internal Clock, **Channel1 = Output Compare No Output**, CH1 Mode Frozen, auto-reload preload Enable |
-| TIM NVIC | Update + CC1; gelişmiş timer'da (TIM1/TIM8) **iki IRQ de** |
-| HAL timebase | FreeRTOS varsa SysTick ona ait → timebase ayrı bir TIM (TIM6/TIM7) |
-| Register Callback | SPI ve TIM için **DISABLE** |
-
-Timer frekansı `BTM_PWM_HZ` ile **birebir aynı** olmalı. `BTM_Init` bunu artık
-kendisi ölçer: `tim_clk_hz / ((PSC + 1) * (ARR + 1))` değerini `BTM_PWM_HZ` ile
-karşılaştırır ve %5'ten fazla saparsa `HAL_ERROR` döner (fault kaydedilmez, config
-reddedilir). Bu yüzden config'e timer'ın besleme saati de yazılır. `ARR = 999` ile:
-
-| Timer saati | PSC |
-|---|---|
-| 84 MHz (F4 APB1: TIM2..TIM7) | 419 |
-| 168 MHz (F4 APB2: TIM1, TIM8..) | 839 |
-
-`tim_clk_hz` bu tablodaki **timer saati** değeridir, PSC ile bölünmüş değer değil.
-
-### 6.2 Kod
-
-```c
-#include "BTM9011EP.h"
-
-static const BTM_Config btm_cfg = {
-    .spi         = &hspi2,
-    .cs_port     = BTM_CS_GPIO_Port,
-    .cs_pin      = BTM_CS_Pin,
-    .tim         = &htim1,       /* zorunlu */
-    .tim_clk_hz  = 168000000U,   /* zorunlu: timer'ın besleme saati (htim1 APB2'de).
-                                  * Init bununla PSC/ARR'dan gerçek frekansı ölçer ve
-                                  * BTM_PWM_HZ ile uyuşmazsa HAL_ERROR döner. */
-    .forward_ms  = 6000U,        /* KARTTA ÖLÇÜLECEK: TAM HIZ strok süresi + pay.
-                                  * Düşük duty'de sürücü bunu kendi ölçekler (§3.1);
-                                  * üst sınır BTM_MAX_MOVE_MS. */
-    .backward_ms = 6000U,
-};
-
-if (BTM_Init(&btm_cfg) != HAL_OK) {
-    BTM_Status st; BTM_GetStatus(&st);
-    /* FAULT_COMM -> cihaz bağlı değil / SPI modu yanlış / pinler ters
-       FAULT_DWT  -> çekirdekte DWT yok veya debugger almış
-       fault NONE -> config reddedildi: tim_clk_hz / PSC / ARR uyuşmuyor, strok
-                     süresi 0 veya BTM_MAX_MOVE_MS'ten büyük */
-    Error_Handler();
-}
-```
-
-Callback yönlendirmeleri (USER CODE 4). Callback projede zaten varsa yeni fonksiyon
-yazma, satırı mevcut olanın içine ekle:
-
-```c
-void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *h)        { BTM_OnSpiComplete(h); }
-void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *h)           { BTM_OnSpiError(h); }
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *h)   { BTM_OnTimerPeriod(h); }
-void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *h) { BTM_OnTimerCompare(h); }
-```
-
-### 6.3 Sahip görev
-
-```c
-static void actuator_move(BTM_Direction dir, uint32_t duty)
-{
-    uint32_t rem;
-    uint8_t  cmd;
-
-    HAL_StatusTypeDef res = (duty >= 100U) ? BTM_Move(dir) : BTM_MovePwm(dir, duty);
-
-    if (res != HAL_OK) {
-        /* HAL_BUSY: hat bir an meşgul, ya da ısıl dinlenme / ters yön ölü süresi
-         *   dolmadı (§3.3). Hiçbir şey olmadı; sonra tekrar dene.
-         * Diğerleri: sürüş komutu cihaza GİTMİŞ olabilir. Sürücü fren denedi ve
-         *   fault kaydetti; emniyet payı olarak bir kez daha frenle, sonra
-         *   kurtarma politikasını uygula (§6.4). */
-        if (res != HAL_BUSY) { (void)BTM_Brake(); }
-        return;
-    }
-
-    while ((rem = BTM_RemainingMs()) > 0U) {
-        /* hareket boyunca görev UYUR: yoklama yok */
-        if (xQueueReceive(cmd_q, &cmd, pdMS_TO_TICKS(rem)) == pdTRUE) {
-            if (cmd == CMD_STOP) { BTM_Brake(); return; }
-        }
-    }
-
-    /* Süre dolduğunda sürücü ZATEN frenledi. Buradaki çağrı emniyet payıdır:
-     * TIM callback'leri yanlışlıkla yönlendirilmemişse sürücünün içinde hiçbir
-     * kod çalışmaz ve motor süresiz sürüşte kalırdı. Maliyeti 3 çerçeve (~90 us),
-     * idempotenttir. */
-    (void)BTM_Brake();
-}
-```
-
-Komutlar başka görevden (UART, CAN) geliyorsa sürücüyü oradan çağırma; kuyrukla
-sahip göreve aktar. Komut fonksiyonları ISR'dan veya kesmeler kapalıyken
-çağrılırsa `HAL_BUSY` döner. `BTM_RemainingMs` ve `BTM_GetStatus` her yerden
-çağrılabilir.
-
-### 6.4 Hata kilidinden çıkma (politika uygulamada)
-
-Sürücü kendi kendine denemez; kaç kez ve hangi aralıkla denenecek uygulamanın
-kararıdır. Sahip görevde sınırlı denemeli bir örnek:
-
-```c
-#define BTM_CLEAR_TRIES 3U
-
-/** Hata kilidini sınırlı sayıda dener. 1 döndüyse sürücü yeniden kullanılabilir. */
-static uint8_t actuator_recover(void)
-{
-    uint32_t i;
-
-    for (i = 0U; i < BTM_CLEAR_TRIES; i++) {
-        HAL_StatusTypeDef res = BTM_ClearFault();
-
-        if (res == HAL_OK) { return 1U; }            /* kilit açıldı, durum IDLE */
-
-        if (res != HAL_BUSY) {                       /* HAL_ERROR veya HAL_TIMEOUT */
-            BTM_Status st;
-            (void)BTM_GetStatus(&st);
-            /* Sebep sürüyor: st.fault + st.status_byte'a bak.
-             * FAULT_DWT, OCA/OCB veya COMM ise denemeyi bırak — fiziksel sebep. */
-            if (st.fault != BTM_FAULT_NONE) { return 0U; }
-        }
-        /* HAL_BUSY: hiçbir şey değişmedi, biraz bekle ve tekrar dene */
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    return 0U;
-}
-```
-
-**Körlemesine döngüye sokma.** `ClearFault` hattı yeniden sınadığı için kalıcı bir
-arızada her denemede 3 çerçeve harcar ve `HAL_ERROR` döner; sebep (`st.fault`,
-`st.status_byte`) incelenmeden tekrarlamak arızayı maskelemekten başka işe yaramaz.
-UV gibi geçici bir sebebin gerçekten geçmesi için denemeler arasında beklemek gerekir.
-
----
-
-## 6.4 Başka bir STM32 ailesi (ör. STM32H7)
+## 6.1 Başka bir STM32 ailesi (ör. STM32H7)
 
 Sürücü aile bağımsızdır; yalnız HAL başlığı verilir:
 
@@ -450,22 +298,11 @@ Lock Access Register'a anahtar yazılmasını isteyebilir; sürücü bunu
 `__CORTEX_M == 7` koşuluyla kendi yapar (M4'te o yazmaç yoktur). Açılmasaydı
 `CYCCNT` saymaz ve `BTM_Init` güvenli biçimde `HAL_ERROR` + `FAULT_DWT` dönerdi.
 
-Doğrulananlar (STM32Cube_FW_H7 v1.12.1 ve arm-none-eabi-gcc 13.3 ile) — bu tablo
-**v2 kodu üzerinde** üretildi:
-
-| | Durum |
-|---|---|
-| Kullanılan HAL fonksiyonları ve makroları H7 HAL'de var | ✔ |
-| `cortex-m7 -O2` sıkı uyarılarla derleniyor | ✔ (0 uyarı) |
-| M7 yolunda `LAR` yazması üretiliyor | ✔ |
-| M7 yolunda host testleri geçiyor | ✔ (v2'de 18 grup / 74 doğrulama) |
-| Kesme maskeleme | ✔ yok (`cpsid=0`) |
-
-> **v3 notu:** v3'ün iki değişikliği (`BTM_ClearFault`, duty ölçeklemesi) yeni HAL
-> çağrısı veya çekirdeğe özgü komut **eklemez** — yalnız mevcut yardımcıları ve
-> tamsayı aritmetiğini kullanır, bu yüzden H7 uyumunun bozulması beklenmez. Yine de
-> yukarıdaki tablo v3 kodu için **yeniden koşturulmamıştır**; H7'ye taşınırken
-> `cortex-m7 -O2` derlemesi ve host testleri tekrar çalıştırılmalıdır.
+> **Doğrulanmadı:** H7 için bu depoda yeniden üretilebilir bir derleme veya kart
+> sonucu yoktur. Taşırken `cortex-m7 -O2 -Wall -Wextra` derlemesini ve
+> [`INTEGRATION.md` §9](INTEGRATION.md#9-devreye-alma-sırası) devreye alma adımlarını
+> kendin çalıştır. Sürücü kesme maskelemez (`objdump`'ta `cpsid`/`cpsie`/`msr basepri`
+> bulunmaz); bu özellik her derlemede yeniden kontrol edilmelidir.
 
 Aile değişince **yeniden hesaplanması gerekenler**:
 
@@ -503,16 +340,16 @@ Derleyici satırından (`-D...`) verilebilen tek şey, **karta ve aktüatöre ba
 
 | Makro | Varsayılan | Not |
 |---|---|---|
-| `BTM_PWM_HZ` | 200 | Timer frekansıyla aynı olmalı; `BTM_Init` bunu ölçüp doğrular (§6.1). Aralık 50..1500 |
+| `BTM_PWM_HZ` | 200 | Timer frekansıyla aynı olmalı; `BTM_Init` bunu ölçüp doğrular ([INTEGRATION.md §2](INTEGRATION.md#2-çevre-birimleri)). Aralık 50..1500 |
 | `BTM_REST_RATIO` | 4 | Isıl dinlenme katsayısı (§3.3). Aktüatörün azami duty cycle'ından gelir: %20 → 4. `0` kapıyı kapatır |
 | `BTM_REVERSE_MS` | 100 | Ters yöne geçiş ölü süresi, ms (§3.3) |
 | `BTM_CMD_FORWARD` / `_BACKWARD` | 0x51 / 0x31 | **Kartta ölçülmeli** (8. bölüm) |
 | `BTM9011EP_HAL_HEADER` | `"stm32f4xx_hal.h"` | Başka aile için override |
 
 Geri kalanlar sürücünün **iç zamanlama sabitleridir**, ayar düğmesi değil: hiçbiri
-dışarıdan override edilemez, çünkü testler yalnız bu değerlerle koşuyor ve birkaçı
+dışarıdan override edilemez, çünkü sürücü yalnız bu değerlerle doğrulandı ve birkaçı
 birbirine bağlı (`BTM_FRAME_US` duty alt sınırını, o da süre ölçeklemesini etkiler).
-Değiştirmek gerekiyorsa `BTM9011EP.h`'de değiştirip testleri yeniden koştur.
+Değiştirmek gerekiyorsa `BTM9011EP.h`'de değiştirip kartta yeniden doğrula.
 
 | Sabit | Değer | Ne işe yarar |
 |---|---|---|
@@ -592,48 +429,9 @@ Sıra önemli — ilk iki madde motora komut vermeden yapılır.
 
 ---
 
-## 10. Test
+## 10. Doğrulama
 
-```sh
-./tests/run_tests.sh
-```
-
-Gerçek `BTM9011EP.c`'yi taklit HAL ile derler; donanım gerekmez. Taklit cihaz
-modeli datasheet Şekil 27'deki **bir çerçeve gecikmeli cevabı** taklit eder, yani
-4. bölümdeki üçlü şema modelden doğrulanır.
-
-**38 grup / 193 doğrulama:** Init ve hat doğrulaması, kopuk cihaz (`0xFF`), config
-zorunlulukları, tam hızda kendiliğinden fren, her periyotta status okunması, PWM
-akışı, `RemainingMs` ve erken fren, ters yön, OC, UV teyidi, OL'in hata
-üretmemesi, düşen çerçeve sayacı, fault'ta frenin gerçekten gönderilmesi, SPI hata
-yolu, geçici meşguliyetin fault üretmemesi, takılı `FINISHING`'den çıkış,
-`FAULT_DWT`'nin okunabilmesi, ISR'ların yabancı handle'ları yok sayması, ham baytların
-saklanması.
-
-v3'te eklenen 10 grup (21–30): `ClearFault` sonrası kilidin açılması ve hareketin
-tekrar edilebilmesi, sebep sürüyorsa kilidin geri gelmesi, `FAULT_DWT`'nin
-temizlenememesi, hata yokken `ClearFault`'un çerçeve harcamaması, meşgul hatta
-`HAL_BUSY` dönüp **hiçbir şeyi değiştirmemesi**, `dropped_frames`'in korunması,
-duty ölçeklemesi (süre, periyot sayısı ve `RemainingMs`), `BTM_MAX_MOVE_MS` kırpması
-ve bayrağı, config sınırı, ölçeklenmiş sürenin sonunda sürücünün kendi frenlemesi,
-"kabloyu düzelttim" akışı (Init `FAULT_COMM` → `ClearFault` → hareket).
-
-v3.1'de eklenen 8 grup (31–38): sürüş komutu gittikten sonra echo tutmazsa ve çerçeve
-ortasında SPI hata verirse **frenin de gönderilmesi**, timer frekansı `BTM_PWM_HZ` ile
-uyuşmuyorsa Init'in reddetmesi, ters yön ölü süresi, ısıl dinlenmenin fiilen süren
-süreye dayanması ve `BTM_Poll`'un taze status baytı getirmesi; ayrıca timer'ın bekleyen `UIF`
-bayrağının hareketi bir periyot kısaltmaması (taklit HAL artık bekleyen bayrakla
-başlatmanın kesmeyi anında tetiklemesini de modelliyor) ve `BTM_RemainingMs`'in
-duvar saatinden değil periyot sayacından gelmesi. Polling çerçevesinin
-hata yolu için taklit HAL'e `spi_fail_in` kancası eklendi; o dal daha önce hiç test
-edilmiyordu, çünkü taklit her zaman `HAL_OK` dönüyordu.
-
-İki geri alma yolu da kapsanıyor: hat `ClearFault`'un **ilk beklemesinde** meşgulse
-ve hat ilk beklemeyi geçip **doğrulanmış komutun içinde** meşgulleşirse. İkincisi
-için taklit HAL'e `busy_on_gettick` kancası eklendi; o dal olmasa sessizce
-test edilmemiş kalırdı.
-
-> **MSYS2 notu:** `/mingw64` ve `/ucrt64` DLL'leri PATH'te karışırsa `gcc` hata
-> mesajı bile basmadan exit 1 döner. `run_tests.sh` PATH'i `ucrt64` ile sınırlar.
-
-Fiziksel zamanlama ve motor davranışı kartta ayrıca doğrulanmalıdır (8. bölüm).
+Bu depoda otomatik host testi **yoktur**. Doğrulama durumu (derleme ve kart
+sonuçları, hangi HAL sürümü ve kartla) [`INTEGRATION.md` §11](INTEGRATION.md#11-doğrulama-durumu)
+tablosunda tutulur; fiziksel zamanlama ve motor davranışı kartta doğrulanmalıdır
+(8. bölüm).
