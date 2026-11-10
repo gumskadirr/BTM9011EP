@@ -1,4 +1,0 @@
-# Satir sonlari her yerde LF kalsin: run_tests.sh CRLF ile calismaz (shebang bozulur),
-# C kaynaklarinda da gereksiz diff uretir.
-* text=auto eol=lf
-*.exe binary
