@@ -1,4 +1,5 @@
-# BTM9011EP_Sade_v3
+# BTM9011EP
+
 
 STM32 HAL için tek BTM9011EP sürücüsü. Hedef: **Actuonix P8 `-S`** (2 kablolu,
 strok sonu limit switch'li) lineer aktüatörü iki uç nokta arasında sürmek.
