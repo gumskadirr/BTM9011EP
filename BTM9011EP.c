@@ -4,7 +4,12 @@
  *
  * TEK SÜRÜŞ YOLU: tam hız da PWM de timer üzerinden yürür. Tam hız, "duty %100,
  * compare çerçevesi yok" demektir. Süreyi her iki kipte de timer sayar ve dolunca
- * sürücü kendi frenler; uygulamanın sonda bir şey yapması gerekmez.
+ * sürücü kendi frenler; uygulamanın sonda bir şey yapması gerekmez. Süre UYGULANAN
+ * duty'ye göre ölçeklenir (plan_move_ms), yani config'teki değer "tam hız strok
+ * süresi"dir ve strok düşük duty'de de tamamlanır.
+ *
+ * HATA KİLİDİ geçicidir: BTM_ClearFault() hattı doğrulanmış fren komutuyla yeniden
+ * sınar ve tutarsa kilidi açar. FAULT_DWT donanımsal olduğu için temizlenmez.
  *
  * EŞZAMANLILIK — kesme maskelemesi YOK:
  *   - Komut fonksiyonları yalnız sahip görevden çağrılır (tek yazar).
@@ -32,7 +37,6 @@ static uint32_t cycles_per_us = 1U;
 static volatile uint32_t tcsl_cycles;
 static volatile uint8_t awake;            /* cs_drop() ISR'dan yazar, xfer() okur */
 
-static volatile uint32_t state_seq;
 static volatile BTM_State state = BTM_STATE_IDLE;
 static volatile uint32_t cs_low_cycles;
 static volatile uint8_t tx_byte;
@@ -42,11 +46,18 @@ static volatile uint8_t last_cmd = BTM_CMD_BRAKE;
 static volatile uint8_t pwm_cmd;
 static volatile uint32_t periods_left;
 static volatile uint32_t duty_percent;
-static volatile uint32_t move_deadline;
+static volatile uint32_t move_start_tick;    /* Hareketin başladığı an (ısıl bütçe) */
 static volatile uint32_t finish_tick;
+static volatile uint32_t move_ms;            /* Planlanan hareket süresi */
+static volatile uint8_t move_ms_estimated;   /* duty<100: süre tahmin edildi */
+static volatile uint8_t move_ms_clamped;     /* BTM_MAX_MOVE_MS'e kırpıldı */
+static volatile uint32_t last_stop_tick;     /* Son hareketin bittiği an */
+static volatile uint32_t last_move_ms;       /* O hareketin FİİLEN sürdüğü süre */
+static volatile BTM_Direction last_dir;      /* Son sürülen yön */
 
 static volatile uint8_t status_byte;
 static volatile uint8_t status_valid;
+static volatile uint8_t echo_byte;       /* Son HAM control byte okuması */
 static volatile uint32_t dropped_frames;
 static volatile uint32_t drop_run;
 static volatile uint32_t uv_run;
@@ -55,8 +66,10 @@ static volatile uint32_t hal_error;
 
 /* ==================== Yardımcılar ==================== */
 
-static void publish(void) { __DMB(); state_seq++; }
-static void set_state(BTM_State s) { state = s; publish(); }
+/** Bellek bariyeri: durum yazmaları, onlara bakan ISR'ların göreceği sırayla
+ *  tamamlansın (sürücü kesme maskelemediği için sıralama tek güvencedir). */
+static void barrier(void) { __DMB(); }
+static void set_state(BTM_State s) { state = s; barrier(); }
 
 static uint8_t task_context(void)
 {
@@ -80,6 +93,11 @@ static uint8_t dwt_start(void)
 {
     uint32_t a, b;
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+#if defined(__CORTEX_M) && (__CORTEX_M == 7U)
+    /* Cortex-M7'de (F7/H7) DWT kilitli olabilir: CTRL yazılabilmesi için önce
+     * Lock Access Register'a anahtar yazılır. M4'te bu yazmaç yoktur. */
+    DWT->LAR = 0xC5ACCE55U;
+#endif
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
     a = DWT->CYCCNT; __NOP(); __NOP(); __NOP(); __NOP(); b = DWT->CYCCNT;
     return (b != a) ? 1U : 0U;
@@ -122,6 +140,81 @@ static uint32_t dir_travel_ms(BTM_Direction d)
     return (d == BTM_DIR_FORWARD) ? cfg.forward_ms : cfg.backward_ms;
 }
 
+/**
+ * Hareket süresini duty ile ölçekler ve BTM_MAX_MOVE_MS'e kırpar.
+ *
+ * Model: ortalama köprü gerilimi duty ile doğrusal, fırça DC motorun boştaki
+ * hızı gerilimle doğrusal -> süre ~ 1/duty. Bu bir TAHMİNDİR: aktüatörün ölü
+ * bölgesi (çok düşük duty'de hiç kalkmaması), yük ve sürtünme modele girmez.
+ * Bu yüzden ölçekleme yapıldığında move_ms_estimated bayrağı kalkar ve gerçek
+ * süre kartta ölçülmelidir (README §8).
+ *
+ * Taşma: travel Init'te BTM_MAX_MOVE_MS (<= 600000) ile sınırlandığı için
+ * travel * 100 en çok 6e7'dir; uint32 sınırının çok altında.
+ */
+static uint32_t plan_move_ms(uint32_t travel, uint32_t duty)
+{
+    uint32_t ms = travel;
+
+    move_ms_estimated = 0U;
+    move_ms_clamped = 0U;
+    if (duty == 0U) { duty = 1U; }   /* çağrı yolları engelliyor; sıfıra bölme kalkanı */
+
+    if (duty < 100U)
+    {
+        ms = ((travel * 100U) + (duty - 1U)) / duty;   /* yukarı yuvarla */
+        move_ms_estimated = 1U;
+    }
+    if (ms > BTM_MAX_MOVE_MS)
+    {
+        ms = BTM_MAX_MOVE_MS;
+        move_ms_clamped = 1U;      /* strok tamamlanmayabilir */
+    }
+    return ms;
+}
+
+/**
+ * Timer gerçekten BTM_PWM_HZ'de mi dönüyor?
+ *
+ * Süre sayımı periyotları saydığı için (periods_left), timer başka bir frekansta
+ * dönerse BÜTÜN süreler aynı oranda kayar: yanlış PSC girildiğinde hareket iki kat
+ * uzun sürer, ısıl bütçe iki katına çıkar ve BTM_RemainingMs gerçekle ayrışır.
+ * Kurulumda en sık yapılan hata budur (F4'te timer'ın APB1'de mi APB2'de mi olduğu
+ * karıştırılır), bu yüzden kart üstünde değil Init'te yakalanır. %5 tolerans,
+ * tam bölünmeyen PSC/ARR seçimlerine yer bırakır.
+ */
+static uint8_t tim_hz_ok(const BTM_Config *c)
+{
+    uint32_t div, hz;
+
+    if ((c->tim_clk_hz == 0U) || (c->tim->Instance == NULL)) { return 0U; }
+    div = (c->tim->Instance->PSC + 1U) * (__HAL_TIM_GET_AUTORELOAD(c->tim) + 1U);
+    if (div == 0U) { return 0U; }
+
+    hz = c->tim_clk_hz / div;
+    return ((hz >= (BTM_PWM_HZ - (BTM_PWM_HZ / 20U))) &&
+            (hz <= (BTM_PWM_HZ + (BTM_PWM_HZ / 20U)))) ? 1U : 0U;
+}
+
+/**
+ * Hareket bitti: FİİLEN süren sürüş süresini ve bitiş anını saklar. Isıl dinlenme
+ * (BTM_REST_RATIO) ve ters yön ölü süresi (BTM_REVERSE_MS) bunlardan hesaplanır.
+ *
+ * Erken frende planlanan değil GEÇEN süre esas alınır: 6 s'lik strok 2 s sonra
+ * kesildiyse aktüatör 2 s ısındı, 24 s değil 8 s dinlenme ister. Ölçü duvar saatidir
+ * (periyot sayısı değil): kesmeler gecikse bile köprü o süre boyunca sürüyordu.
+ *
+ * YALNIZ gerçekten süren bir hareketten çıkarken çağrılır; boştaki bir fren
+ * çağrısı dinlenme saatini yeniden başlatmamalıdır.
+ */
+static void note_stop(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    last_move_ms = now - move_start_tick;   /* duvar saati: aktüatör gerçekte bu kadar ısındı */
+    last_stop_tick = now;
+}
+
 static void stop_timer(void)
 {
     if (cfg.tim != NULL)
@@ -143,7 +236,7 @@ static void record_fault(BTM_Fault f)
         __DMB();
         fault = f;
     }
-    publish();
+    barrier();
     stop_timer();
 }
 
@@ -159,15 +252,17 @@ static void drop_frame(void)
  *  desenlerinde değil (datasheet Tablo 12). */
 static void eval_status(uint8_t s)
 {
-    /* 0xFF: MISO pull-up'lı, cihaz cevap vermiyor. Bit 7'si 1 olduğu için
-     * "bit7 set ise status baytıdır" testini tek başına geçerdi. */
-    if ((s == 0xFFU) || ((s & BTM_ST_SDO_SEL) == 0U))
+    /* Ham bayt HER ZAMAN saklanır, geçerliliği ayrı bayrakta: COMM hatasında
+     * "ne okundu" debug'da görünsün. 0xFF = cihaz hatta yok (MISO pull-up);
+     * başka bir desen = SPI modu / bit sırası / kablolama. Bit 7'si 1 olduğu
+     * için 0xFF, "bit7 set ise status baytıdır" testini tek başına geçerdi. */
+    status_byte = s;
+    status_valid = ((s != 0xFFU) && ((s & BTM_ST_SDO_SEL) != 0U)) ? 1U : 0U;
+    if (!status_valid)
     {
         record_fault(BTM_FAULT_COMM);
         return;
     }
-    status_byte = s;
-    status_valid = 1U;
 
     if ((s & BTM_ST_HARD) != 0U) { record_fault(BTM_FAULT_DEVICE); return; }
 
@@ -234,6 +329,7 @@ static HAL_StatusTypeDef send_verified(uint8_t cmd)
     res = xfer((uint8_t)(base | BTM_SDO_SEL), &echo);
     if (res == HAL_BUSY) { return HAL_BUSY; }
     if (res != HAL_OK)   { record_fault(BTM_FAULT_SPI); return res; }
+    echo_byte = echo;    /* Doğrulamadan ÖNCE sakla: hata halinde de elde kalsın. */
 
     res = xfer((uint8_t)(base | BTM_SDO_SEL), &stat);
     if (res == HAL_BUSY) { return HAL_BUSY; }
@@ -247,7 +343,7 @@ static HAL_StatusTypeDef send_verified(uint8_t cmd)
     if (echo != base) { record_fault(BTM_FAULT_COMM); return HAL_ERROR; }
 
     eval_status(stat);
-    publish();
+    barrier();
     return (fault != BTM_FAULT_NONE) ? HAL_ERROR : HAL_OK;
 }
 
@@ -282,12 +378,16 @@ static uint8_t send_it(uint8_t cmd)
 /** Süre dolunca periyot ISR'ından: timer durur, son fren gider. */
 static void move_finish(void)
 {
+    note_stop();
     stop_timer();
     finish_tick = HAL_GetTick();
     set_state(BTM_STATE_FINISHING);
-    /* Motor bu anda zaten frende olabilir (PWM'de önceki compare çerçevesi).
-     * Son fren başlatılamazsa boşa geç. */
-    if (!send_it(BTM_CMD_BRAKE)) { set_state(BTM_STATE_IDLE); }
+
+    /* Son fren çerçevesi başlatılamazsa BOŞA GEÇME. Tam hız kipinde compare
+     * çerçevesi olmadığı için son gönderilen komut SÜRÜŞTÜR; burada IDLE ilan
+     * etmek "boştayım, hata yok" derken motoru sürüşte bırakmak olurdu.
+     * Duruşu garanti edemedik: hata olarak bildir, uygulama görsün. */
+    if (!send_it(BTM_CMD_BRAKE)) { record_fault(BTM_FAULT_OVERLAP); }
 }
 
 /** Son fren çerçevesinin tamamlanma geri çağrısı hiç gelmezse (callback bağlı
@@ -309,7 +409,14 @@ HAL_StatusTypeDef BTM_Init(const BTM_Config *config)
     if (inited) { return HAL_BUSY; }
     if ((config == NULL) || (config->spi == NULL) || (config->cs_port == NULL) ||
         (config->tim == NULL)) { return HAL_ERROR; }
-    if ((config->forward_ms == 0U) || (config->backward_ms == 0U)) { return HAL_ERROR; }
+    /* Strok süreleri BTM_MAX_MOVE_MS ile sınırlı: hem anlamsız değerleri eler hem
+     * plan_move_ms()'teki çarpımların taşmadığını ispatlanabilir kılar. */
+    if ((config->forward_ms == 0U) || (config->forward_ms > BTM_MAX_MOVE_MS) ||
+        (config->backward_ms == 0U) || (config->backward_ms > BTM_MAX_MOVE_MS))
+    {
+        return HAL_ERROR;
+    }
+    if (!tim_hz_ok(config)) { return HAL_ERROR; }
 
     cfg = *config;
 
@@ -338,7 +445,7 @@ HAL_StatusTypeDef BTM_Init(const BTM_Config *config)
 
 static HAL_StatusTypeDef start_move(BTM_Direction dir, uint32_t duty)
 {
-    uint32_t travel, arr;
+    uint32_t travel, arr, idle;
     HAL_StatusTypeDef res;
 
     if (!inited)         { return HAL_ERROR; }
@@ -352,22 +459,55 @@ static HAL_StatusTypeDef start_move(BTM_Direction dir, uint32_t duty)
     release_stuck_finish();
     if (state != BTM_STATE_IDLE) { return HAL_BUSY; }
 
+    /* Aktüatörü koru (ikisi de donanım gerçeği, ayarları BTM9011EP.h'de):
+     *   - ters yöne geçişte ölü süre: dönen motora ters gerilim = aşırı akım,
+     *   - ısıl dinlenme: P8 azami %20 duty cycle ister.
+     * HAL_BUSY döner: geçicidir, çağrı tekrarlanabilir, fault üretmez. İlk
+     * hareketten önce last_move_ms 0 olduğu için iki kapı da etkisizdir. */
+    idle = HAL_GetTick() - last_stop_tick;
+    if (last_move_ms != 0U)
+    {
+        if ((dir != last_dir) && (idle < BTM_REVERSE_MS)) { return HAL_BUSY; }
+        if (idle < (last_move_ms * BTM_REST_RATIO))       { return HAL_BUSY; }
+    }
+
     duty_percent = (duty >= 100U) ? 100U : clamp_duty(duty);
     pwm_cmd = dir_cmd(dir);
-    move_deadline = HAL_GetTick() + travel;
+    last_dir = dir;
+
+    /* Süre UYGULANAN duty'ye göre ölçeklenir: duty %50 -> süre 2 katı. Böylece
+     * forward_ms/backward_ms "tam hız strok süresi" olarak kalır ve strok düşük
+     * duty'de de tamamlanır. Kırpıldıysa move_ms_clamped bayrağı kalkar. */
+    move_ms = plan_move_ms(travel, duty_percent);
+    move_start_tick = HAL_GetTick();
     uv_run = 0U;
     drop_run = 0U;
 
     /* Komut önce doğrulanmış biçimde gider: hattın ve cihazın sağlığı çerçeve
      * akışı başlamadan bilinsin. Timer henüz durmuş olduğu için ISR çalışmaz. */
     res = send_verified(pwm_cmd);
-    if (res != HAL_OK) { return res; }   /* HAL_BUSY geçicidir, çevrilmez */
+    if (res != HAL_OK)
+    {
+        /* HAL_BUSY: ilk çerçeve hiç gitmedi, köprü sürüşe alınmadı — fren gerekmez
+         * ve meşgul hatta beklemek boşunadır (HAL_BUSY geçicidir, çevrilmez).
+         * Diğer hatalarda çerçeve(ler) GİTTİ, yani köprü sürüşte olabilir: komut
+         * CS düşerken uygulanır ve echo/status ancak sonraki çerçevede görülür.
+         * Duruşu garanti etmek için fren denenir, hata yine çağırana döner. */
+        if (res != HAL_BUSY) { (void)send_verified(BTM_CMD_BRAKE); }
+        return res;
+    }
 
     arr = __HAL_TIM_GET_AUTORELOAD(cfg.tim);
     __HAL_TIM_SET_COUNTER(cfg.tim, 0U);
     __HAL_TIM_SET_COMPARE(cfg.tim, TIM_CHANNEL_1, ((arr + 1U) * duty_percent) / 100U);
 
-    periods_left = (travel * BTM_PWM_HZ) / 1000U;
+    /* Durdurulmus timer'in SR'sinde UIF/CC1IF bekleyebilir (sayici dururken bayrak
+     * temizlenmez). Sayici yeniden baslatilinca NVIC o bekleyen kesmeyi ANINDA
+     * calistirir: hareket bir periyot eksik baslar ve hatta gereksiz bir cerceve
+     * girer. Bu yuzden kapi acilmadan once bayraklar temizlenir. */
+    __HAL_TIM_CLEAR_FLAG(cfg.tim, TIM_FLAG_UPDATE | TIM_FLAG_CC1);
+
+    periods_left = (move_ms * BTM_PWM_HZ) / 1000U;
     if (periods_left == 0U) { periods_left = 1U; }
 
     set_state(BTM_STATE_MOVING);   /* kapı açılır; sonra timer başlar */
@@ -399,9 +539,10 @@ HAL_StatusTypeDef BTM_Brake(void)
 
     if (state != BTM_STATE_FAULT)
     {
+        if (state == BTM_STATE_MOVING) { note_stop(); }
         state = BTM_STATE_IDLE;   /* ÖNCE kapıyı kapat, SONRA timer'ı durdur */
         __DMB();
-        publish();
+        barrier();
     }
     stop_timer();
 
@@ -420,13 +561,101 @@ HAL_StatusTypeDef BTM_Brake(void)
     return send_verified(BTM_CMD_BRAKE);
 }
 
+/**
+ * Hata kilidini açar. Sözleşme BTM9011EP.h'de.
+ *
+ * SIRA ÖNEMLİ: timer durdurulur, uçuştaki çerçevenin bitmesi beklenir, SONRA
+ * sayaçlar sıfırlanıp durum IDLE'a alınır. Timer durmuş ve durum MOVING değil
+ * olduğu için ISR'lar bu sırada hiçbir çerçeve göndermez.
+ *
+ * Hattı doğrulanmış FREN komutuyla sınar — temizleme ancak cihaz konuşuyorsa ve
+ * status baytı temizse başarılıdır. Arızanın sebebi sürüyorsa (OC hâlâ set, UV
+ * hâlâ düşük) send_verified içinde yeni bir fault kaydedilir ve kilit geri gelir;
+ * yani bu fonksiyon "hatayı yok sayma" değil "yeniden sınama"dır.
+ *
+ * HAL_BUSY yolunda HİÇBİR ŞEY değişmez: eski fault ve FAULT durumu geri konur,
+ * çünkü hiçbir şey doğrulanamadı.
+ */
+HAL_StatusTypeDef BTM_ClearFault(void)
+{
+    BTM_Fault prev_fault;
+    uint32_t prev_hal_error, prev_drop_run, prev_uv_run, t0;
+    HAL_StatusTypeDef res;
+
+    if (!inited)         { return HAL_ERROR; }
+    if (!task_context()) { return HAL_BUSY; }
+    if (fault == BTM_FAULT_NONE) { return HAL_OK; }    /* temizlenecek bir şey yok */
+
+    /* DWT sayacı donanımsaldır: yeniden sınamanın anlamı yok, delay_us güvenilmez
+     * kalır. Reset (veya debugger'ı bırakmak) gerekir. */
+    if (fault == BTM_FAULT_DWT) { return HAL_ERROR; }
+
+    stop_timer();
+
+    /* Fault çerçeve ortasında oluşmuş olabilir; uçuştaki aktarımı sınırlı bekle. */
+    t0 = HAL_GetTick();
+    while (cfg.spi->State != HAL_SPI_STATE_READY)
+    {
+        if ((HAL_GetTick() - t0) > BTM_INFLIGHT_WAIT_MS) { return HAL_BUSY; }
+    }
+
+    /* HAL_BUSY yolunda durumu BİREBİR geri koyabilmek için hepsi saklanır. */
+    prev_fault = fault;
+    prev_hal_error = hal_error;
+    prev_drop_run = drop_run;
+    prev_uv_run = uv_run;
+
+    /* Kapı IDLE'a alınır ve ardışık sayaçlar sıfırlanır. dropped_frames ömür boyu
+     * toplam olduğu için KORUNUR: teşhis geçmişi silinmez. */
+    drop_run = 0U;
+    uv_run = 0U;
+    hal_error = 0U;
+    fault = BTM_FAULT_NONE;
+    __DMB();
+    state = BTM_STATE_IDLE;
+    barrier();
+
+    res = send_verified(BTM_CMD_BRAKE);
+    if (res == HAL_BUSY)
+    {
+        fault = prev_fault;        /* hiçbir şey doğrulanmadı: eski hali geri koy */
+        hal_error = prev_hal_error;
+        drop_run = prev_drop_run;
+        uv_run = prev_uv_run;
+        __DMB();
+        state = BTM_STATE_FAULT;
+        barrier();
+        return HAL_BUSY;
+    }
+    /* res != HAL_OK ise send_verified zaten record_fault çağırdı: kilit geri geldi
+     * ve BTM_GetStatus yeni sebebi gösterir. */
+    return res;
+}
+
+/**
+ * Boştayken cihazdan TAZE status baytı okur. Sözleşme BTM9011EP.h'de.
+ *
+ * Fren komutunu tekrarlar: boştayken köprü zaten frende olduğu için bu çerçeveler
+ * çıkışları değiştirmez, ama cevap olarak güncel status baytını getirir. Hareket
+ * sırasında gerekmez — kesmeli çerçeveler her periyotta status okur, bu yüzden
+ * MOVING/FINISHING'de HAL_BUSY döner ve hatta çerçeve harcanmaz.
+ */
+HAL_StatusTypeDef BTM_Poll(void)
+{
+    if (!inited)         { return HAL_ERROR; }
+    if (!task_context()) { return HAL_BUSY; }
+    if (fault != BTM_FAULT_NONE) { return HAL_ERROR; }   /* kurtarma ClearFault'un işi */
+    if (state != BTM_STATE_IDLE) { return HAL_BUSY; }
+
+    return send_verified(BTM_CMD_BRAKE);
+}
+
 uint32_t BTM_RemainingMs(void)
 {
-    int32_t diff;
-
+    /* Hareketi bitiren şey periyot sayacıdır, bu yüzden kalan süre de ondan
+     * hesaplanır: bildirilen değer ile hareketin gerçek bitişi ayrışamaz. */
     if (state != BTM_STATE_MOVING) { return 0U; }
-    diff = (int32_t)(move_deadline - HAL_GetTick());
-    return (diff > 0) ? (uint32_t)diff : 0U;
+    return (periods_left * 1000U) / BTM_PWM_HZ;
 }
 
 HAL_StatusTypeDef BTM_GetStatus(BTM_Status *status)
@@ -441,8 +670,12 @@ HAL_StatusTypeDef BTM_GetStatus(BTM_Status *status)
     status->last_cmd       = last_cmd;
     status->status_byte    = status_byte;
     status->status_valid   = status_valid;
+    status->echo_byte      = echo_byte;
     status->duty_percent   = duty_percent;
     status->dropped_frames = dropped_frames;
+    status->move_ms           = move_ms;
+    status->move_ms_estimated = move_ms_estimated;
+    status->move_ms_clamped   = move_ms_clamped;
     return HAL_OK;
 }
 
@@ -474,7 +707,7 @@ void BTM_OnSpiComplete(SPI_HandleTypeDef *hspi)
     {
         eval_status((uint8_t)rx_byte);
         if (state == BTM_STATE_FINISHING) { set_state(BTM_STATE_IDLE); }
-        else { publish(); }
+        else { barrier(); }
     }
 }
 

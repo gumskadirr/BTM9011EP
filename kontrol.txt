@@ -1,0 +1,6 @@
+durumu bytlarda tut mesela initte sorun oluştu bunu debugta görmek isterim
+control ve status her zaman kayıtlı olsun
+pwmli çalışamda hareketin tamamlanmasınından sonra brake yapıyor mu koddda yerini göster
+
+uart tabanlı paket çalışmasına uygun olmalı. paket gelir sonrasında benim fonksiyonum çağrılır dönüş baytı uart ile paket olarak gönderilir.
+çağrılabilecek en sade şekilde çağrılsın

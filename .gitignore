@@ -1,0 +1,4 @@
+# Host testlerinin derleme cikti(lar)i: kaynaktan uretilir, geri alinmaz.
+tests/*.exe
+*.exe
+*.o
